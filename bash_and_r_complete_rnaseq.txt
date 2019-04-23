@@ -1,0 +1,265 @@
+# QC
+
+TAGS=$(ls GSE103958/SRX*.fastq.gz | xargs -n 1 basename | sed 's/.fastq.gz//')
+
+
+for TAG in $TAGS; do
+  OUTDIR="fastqc/$TAG"; mkdir -p "$OUTDIR"
+  fastqc -o "$OUTDIR" "GSE103958/$TAG.fastq.gz" |& tee "$OUTDIR/$TAG.fastqc.log"
+done
+
+# Alignment
+
+TAGS=$(ls fastqs/SRX31956*.fastq.gz | xargs -n 1 basename | sed 's/_[1,2].fastq.gz//' | uniq)
+
+for TAG in $TAGS; do
+  
+  HISAT_IDX=/mnt/reference/Gencode_mouse/release_M20/GRCm38.primary_assembly
+
+  # aligning to the genome reference
+
+  OUTDIR="hisat2/$TAG"; mkdir -p "$OUTDIR"
+  date
+  hisat2 -p 8 --new-summary -x  ${HISAT_IDX} \
+    -1 "GSE103958/$TAG*_1.fastq.gz" -2 "GSE103958/$TAG*_2.fastq.gz" \
+    2> "$OUTDIR/$TAG.hisat2.log" \
+    | samtools view -b - > "$OUTDIR/$TAG.mapped.raw.bam"
+  date
+done
+
+# Indexing and sorting our binary files
+
+TAGS=$(ls GSE103958/SRX*.fastq.gz | xargs -n 1 basename | sed 's/_[1,2].fastq.gz//')
+
+for TAG in $TAGS; do
+  OUTDIR="hisat2";
+  date
+  samtools sort -@ 8 -O bam "$OUTDIR/$TAG/$TAG.mapped.raw.bam" > "$OUTDIR/$TAG.sorted.bam" && \
+    samtools index "$OUTDIR/$TAG.sorted.bam" && \
+  date
+done
+
+# Calculating coverage for vizualization
+
+bamCoverage -b "$OUTDIR/$TAG.sorted.bam" -o "$OUTDIR/$TAG.cov.bw" |& tee "$OUTDIR/$TAG.bamcov.log"
+
+# QC 2
+
+REFGENE_MODEL=/mnt/reference/Gencode_mouse/release_M20/mm10_Gencode_VM18.bed
+  infer_experiment.py -i "$OUTDIR/$TAG.sorted.bam" \
+    -r $REFGENE_MODEL | tee "$OUTDIR/$TAG.infer_experiment.txt"
+
+  REFGENE_MODEL=/mnt/reference/Gencode_mouse/release_M20/mm10_Gencode_VM18.bed
+  read_distribution.py -i "$OUTDIR/$TAG.sorted.bam" \
+    -r $REFGENE_MODEL | tee "$OUTDIR/$TAG.read_distribution.txt"
+
+  REFGENE_MODEL=/mnt/reference/Gencode_mouse/release_M20/mm10_rRNA.bed
+  split_bam.py -i "$OUTDIR/$TAG.sorted.bam" -r $REFGENE_MODEL -o "$OUTDIR/$TAG.rrna" | tee "$OUTDIR/$TAG.split_rrna.txt"
+  rm "$OUTDIR/$TAG.rrna.ex.bam" "$OUTDIR/$TAG.rrna.in.bam" "$OUTDIR/$TAG.rrna.junk.bam"
+
+  REFGENE_MODEL=/mnt/reference/Gencode_mouse/release_M20/mm10.HouseKeepingGenes.bed
+  geneBody_coverage.py \
+    -i $OUTDIR/$TAG.sorted.bam \
+    -o $OUTDIR/$TAG \
+    -r $REFGENE_MODEL
+
+# Counting reads featurecount
+
+GTF=/mnt/reference/Gencode_mouse/release_M20/gencode.vM20.annotation.gtf
+
+  OUTDIR="featureCounts/$TAG"; mkdir -p "$OUTDIR"
+  date
+  featureCounts -a "$GTF" -s 0 -o "$OUTDIR/$TAG.fc.txt" \
+    "hisat2/$TAG.sorted.bam" |& tee "$OUTDIR/$TAG.fc.log"
+  date
+
+  head "$OUTDIR/$TAG.fc.txt"
+  wc -l "$OUTDIR/$TAG.fc.txt"
+
+# Kallisto
+
+mkdir kallisto
+
+  KALLISTO_IDX=/mnt/reference/Gencode_mouse/release_M20/gencode.vM20.transcripts.kalliso.idx
+
+  OUTDIR="kallisto/$TAG"; mkdir -p "$OUTDIR"
+  date
+  # --single -l and -s option should be set for each dataset separately, 200+-50 is most common for single end
+  kallisto quant -i $KALLISTO_IDX -t 8 \
+    --single -l 200 -s 50 \
+    --plaintext \
+    -o $OUTDIR \
+    GSE103958/$TAG*_1.fastq.gz GSE103958/$TAG*_2.fastq.gz |& tee $OUTDIR/$TAG.kallisto.log
+  date
+
+done
+
+# mmquant
+
+
+OUTDIR="mmquant"; mkdir -p "$OUTDIR"
+GTF=/mnt/reference/Gencode_mouse/release_M20/gencode.vM20.annotation.gtf
+date
+mmquant -a "$GTF" -s U -o "$OUTDIR/mmq.txt" \
+  -r hisat2/*/*.bam |& tee "$OUTDIR/mmq.log"
+date
+
+# multiqc of everything
+
+multiqc -x .Rproj.user -f .
+
+#####################################
+############## PCA from featurecounts data done in R
+#####################################
+
+source("./functions.R")
+library(data.table)
+
+# load the featureCount files
+fc.files <- list.files("./featureCounts/", pattern="fc.txt$", recursive = TRUE, full.names = TRUE)
+fc_res <- lapply(fc.files, fread)
+
+# compaile to a matrix
+fc_mat <- do.call(cbind, lapply(fc_res, function(x) x[[ncol(x)]]))
+rownames(fc_mat) <- fc_res[[1]][, Geneid]
+tags <- sapply(fc.files, function (x) gsub(".fc.txt", "", basename(x), fixed=TRUE))
+colnames(fc_mat) <- tags
+
+head(fc_mat)
+tail(fc_mat)
+
+# creating an expression set object
+
+library(Biobase)
+
+condition_full <- read.csv("GEO103958.csv")
+colnames(fc_mat) <- condition_full$Full_name
+
+es <- ExpressionSet(fc_mat)
+
+pData(es)$condition <- condition_full$Condition
+pData(es)$replicate <- condition_full$Replicate
+
+head(pData(es))
+head(pData(es))
+head(fData(es))
+
+head(rownames(es))
+
+fData(es)$ensembl <- gsub("\\.\\d*$", "", rownames(es))
+
+library(org.Mm.eg.db)
+columns(org.Mm.eg.db)
+fData(es)$entrez <- mapIds(org.Mm.eg.db, keys=fData(es)$ensembl, 
+keytype="ENSEMBL", column="ENTREZID" )
+fData(es)$symbol <- mapIds(org.Mm.eg.db, keys=fData(es)$ensembl, 
+keytype="ENSEMBL", column="SYMBOL" )
+
+head(fData(es))
+
+exprs(es)[which(fData(es)$symbol == "Actb"), ]
+
+# PCA
+
+library(limma)
+library(ggplot2)
+library(ggrepel)
+
+es.qnorm <- es
+
+exprs(es.qnorm) <- normalizeBetweenArrays(log2(exprs(es.qnorm) + 1), method="quantile")
+
+es.qnorm.top12K <- es.qnorm
+fData(es.qnorm.top12K)$mean <- apply(exprs(es.qnorm.top12K), 1, mean)
+es.qnorm.top12K <- es.qnorm.top12K[order(fData(es.qnorm.top12K)$mean, decreasing = TRUE), ]
+head(exprs(es.qnorm.top12K))
+es.qnorm.top12K <- es.qnorm.top12K[!duplicated(fData(es.qnorm.top12K)$entrez), ]
+es.qnorm.top12K <- es.qnorm.top12K[!is.na(fData(es.qnorm.top12K)$entrez), ]
+es.qnorm.top12K <- es.qnorm.top12K[1:12000,]
+write.gct(es.qnorm.top12K, file="./es.qnorm.top12k.gct")
+
+p <- pcaPlot(es.qnorm.top12K, 1, 2) + 
+aes(color=condition) + 
+geom_text_repel(aes(label=sample)) 
+print(p)
+ggsave(p, width=6, height=4, file="./es.pca12.png")
+
+# differential expression with DESeq2
+
+library(DESeq2)
+dds <- DESeqDataSetFromMatrix(exprs(es), pData(es), design=~condition)
+dds
+dds <- DESeq(dds)
+dds
+
+plotDispEsts(dds)
+vst <- varianceStabilizingTransformation(dds)
+plotPCA(vst)
+
+dir.create("./de/", showWarnings = F)
+unique(dds$condition)
+# log2FC = IL4 - untr
+de <- results(dds, contrast = c("condition", "INF-y-LPS-24h", "control"), cooksCutoff = F)
+head(de)
+de <- data.table(ID=rownames(de), as.data.table(de))
+head(de)
+
+head(fData(es))
+de <- cbind(de, fData(es))
+de <- de[ID %in% rownames(es.qnorm.top12K), ]
+de <- de[order(stat), ]
+de
+
+de[symbol == "Arg1"]
+
+fwrite(de, file="./de/untr.vs.IL4.de.tsv", sep="\t")
+
+# pathway analysis with fgsea
+
+stats <- de[, setNames(stat, entrez)]
+library(msigdbr)
+# GO BP pathways from MSigDB
+m_df <- msigdbr(species = "Mus musculus", category = "C5", subcategory = "BP")
+m_df
+pathways <- split(m_df$entrez_gene, m_df$gs_name)
+
+library(fgsea)
+fr <- fgsea(pathways, stats, nperm = 100000, nproc=4, minSize=15, maxSize=500)
+fr[order(pval)]
+frML <- fgseaMultilevel(pathways, stats,
+sampleSize = 100,
+nproc=4, minSize=15, maxSize=500)
+frML[order(pval)]
+
+frML[padj < 0.01]
+
+collapsedPathways <- collapsePathways(fr[order(pval)][padj < 0.01], pathways, stats)
+str(collapsedPathways)
+
+mainPathways <- frML[pathway %in% collapsedPathways$mainPathways][
+order(sign(ES)*log(pval)), pathway]
+
+frMain <- frML[match(mainPathways, pathway)]
+frMain[, leadingEdge := lapply(leadingEdge, mapIds, 
+x=org.Mm.eg.db, keytype="ENTREZID", column="SYMBOL")]
+dir.create("gsea")
+fwrite(frMain, file="gsea/untr.vs.IL4.filtered.tsv", sep="\t", sep2=c("", " ", ""))
+
+pdf("gsea/untr.vs.IL4.pdf", width=12, height=2 + length(mainPathways) * 0.25)
+plotGseaTable(pathways = pathways[mainPathways], stats = stats, fgseaRes=frMain, gseaParam = 0.5)
+dev.off()
+
+fr[, leadingEdge := NULL]
+fwrite(frML[order(sign(ES)*log(pval))], file="./gsea/untr.vs.IL4.full.tsv", sep="\t") 
+
+plotEnrichment(pathways[["GO_DEFENSE_RESPONSE_TO_VIRUS"]], stats) + 
+ggtitle("Defense reponse to
+ 
+virus")
+
+plotEnrichment(pathways[["GO_NUCLEOSIDE_TRIPHOSPHATE_METABOLIC_PROCESS"]], stats) + 
+ggtitle("Nucleotide triphosphate metabolism")
+
+plotEnrichment(pathways[["GO_CELLULAR_RESPONSE_TO_CYTOKINE_STIMULUS"]], stats) + 
+ggtitle("Cellular response to cytokines")
+
