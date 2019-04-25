@@ -8,3 +8,5 @@ In January, 2019 we analysed 3 datasets in Phantasus. Now, we repeat the same ex
 Additionally, featurecount, Kallisto, and mmquant pipeline is also presented. Which generates the GEM dataset in the first place.
 
 In all, it's a complete pipeline for rnaseq analysis from reads to data analysis in R.
+
+Step-by-step details will be posted in WIKI of this repository.
